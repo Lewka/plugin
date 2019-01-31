@@ -1,19 +1,16 @@
 package io.eroshenkoam.idea;
 
-import com.intellij.codeInsight.AnnotationUtil;
-import com.intellij.lang.jvm.JvmNamedElement;
-import com.intellij.openapi.actionSystem.AnAction;
-import com.intellij.openapi.actionSystem.AnActionEvent;
-import com.intellij.openapi.actionSystem.PlatformDataKeys;
+import com.intellij.openapi.actionSystem.*;
 import com.intellij.openapi.application.ApplicationManager;
 import com.intellij.openapi.command.CommandProcessor;
+import com.intellij.openapi.module.*;
 import com.intellij.openapi.project.Project;
 import com.intellij.psi.*;
+import com.intellij.psi.search.GlobalSearchScope;
+import com.intellij.psi.search.searches.AllClassesSearch;
 import io.eroshenkoam.idea.util.PsiUtils;
 
-import java.util.Arrays;
-import java.util.List;
-import java.util.Optional;
+import java.util.*;
 import java.util.stream.Collectors;
 
 import static io.eroshenkoam.idea.Annotations.*;
@@ -27,18 +24,35 @@ public class MigrateToJunit5 extends AnAction {
     @Override
     public void actionPerformed(AnActionEvent event) {
         final PsiElement element = event.getData(PlatformDataKeys.PSI_ELEMENT);
-        if (element instanceof PsiClass) {
-            Arrays.stream(((PsiClass) element).getMethods())
-                    .filter(m -> m.hasAnnotation(SERENITY_WITH_TAGS_ANNOTATION))
-                    .forEach(this::migrateTestAnnotations);
+
+        for (Module module : ModuleManager.getInstance(element.getProject()).getSortedModules()) {
+            List<PsiClass> testClasses = AllClassesSearch.search(GlobalSearchScope.moduleScope(module), element.getProject()).findAll()
+                    .stream()
+                    .filter(psiClass -> {
+                        try {
+                            return psiClass.getName().endsWith("Test");
+                        } catch (Exception e) {
+                            return false;
+                        }
+                    })
+                    .collect(Collectors.toList());
+
+            for (PsiClass testClass : testClasses) {
+                if (testClass != null) {
+                    Arrays.stream(testClass.getMethods())
+                            .filter(m -> m.hasAnnotation(SERENITY_WITH_TAGS_ANNOTATION))
+                            .forEach(this::migrateTestAnnotations);
+                }
+            }
         }
     }
 
     private void migrateTestAnnotations(final PsiMethod testMethod) {
+        System.out.println("Working on : " + testMethod.getName());
         migrateTags(testMethod);
         migrateDisplayName(testMethod);
-//        migrateStoriesAnnotation(testMethod);
-//        migrateStepAnnotation(testMethod);
+        migrateTmsLink(testMethod);
+        System.out.println("Done with : " + testMethod.getName());
     }
 
     private void migrateTags(final PsiMethod testMethod) {
@@ -87,59 +101,23 @@ public class MigrateToJunit5 extends AnAction {
         });
     }
 
-    private void migrateStoriesAnnotation(final PsiMethod testMethod) {
-        Optional.ofNullable(testMethod.getAnnotation(ALLURE1_STORIES_ANNOTATION)).ifPresent(oldStoriesAnnotation -> {
-            final PsiArrayInitializerMemberValue value = (PsiArrayInitializerMemberValue) oldStoriesAnnotation
-                    .findDeclaredAttributeValue("value");
+    private void migrateTmsLink(final PsiMethod testMethod) {
+        Optional.ofNullable(testMethod.getAnnotation(SERENITY_ISSUE_ANNOTATION)).ifPresent(serenityIssueAnnotation -> {
+            String value = serenityIssueAnnotation.findDeclaredAttributeValue("value").getText();
 
-            final List<String> stories = Arrays.stream(value.getInitializers())
-                    .map(PsiAnnotationMemberValue::getText)
-                    .collect(Collectors.toList());
-
-            final String storiesText = getStoriesAnnotationText(stories);
-            final PsiAnnotation storiesAnnotation = createAnnotation(storiesText, testMethod);
+            final String featuresText = String.format("@%s(%s)", ALLURE2_TMS_LINK_ANNOTATION, value);
+            final PsiAnnotation junitDisplayAnnotation = createAnnotation(featuresText, testMethod);
 
             final Project project = testMethod.getProject();
             CommandProcessor.getInstance().executeCommand(project, () -> ApplicationManager.getApplication().runWriteAction(() -> {
-                PsiUtils.addImport(testMethod.getContainingFile(), ALLURE2_STORY_ANNOTATION);
-                PsiUtils.addImport(testMethod.getContainingFile(), ALLURE2_STORIES_ANNOTATION);
+                PsiUtils.addImport(testMethod.getContainingFile(), ALLURE2_TMS_LINK_ANNOTATION);
 
-                testMethod.getModifierList().addAfter(storiesAnnotation, oldStoriesAnnotation);
-                oldStoriesAnnotation.delete();
+                testMethod.getModifierList().addAfter(junitDisplayAnnotation, serenityIssueAnnotation);
+                serenityIssueAnnotation.delete();
 
                 PsiUtils.optimizeImports(testMethod.getContainingFile());
-            }), "Migrate Allure Stories", null);
+            }), "Migrate Allure TMSLink annotation", null);
         });
-    }
-
-    private void migrateStepAnnotation(final PsiMethod testMethod) {
-        Optional.ofNullable(testMethod.getAnnotation(ALLURE1_STEP_ANNOTATION)).ifPresent(oldStepAnnotation -> {
-            final String oldStepValue = AnnotationUtil.getDeclaredStringAttributeValue(oldStepAnnotation, "value");
-
-            final String[] params = Arrays.stream(testMethod.getParameters())
-                    .map(JvmNamedElement::getName)
-                    .toArray(String[]::new);
-
-            final String stepValue = convert(oldStepValue, params);
-            final String stepText = String.format("@%s(\"%s\")", ALLURE2_STEP_ANNOTATION, stepValue);
-
-            final PsiAnnotation stepAnnotation = createAnnotation(stepText, testMethod);
-
-            final Project project = testMethod.getProject();
-            CommandProcessor.getInstance().executeCommand(project, () -> ApplicationManager.getApplication().runWriteAction(() -> {
-                PsiUtils.addImport(testMethod.getContainingFile(), ALLURE2_STEP_ANNOTATION);
-                testMethod.getModifierList().addAfter(stepAnnotation, oldStepAnnotation);
-                oldStepAnnotation.delete();
-                PsiUtils.optimizeImports(testMethod.getContainingFile());
-            }), "Migrate Allure Steps", null);
-        });
-    }
-
-    private String getFeaturesAnnotationText(final List<String> features) {
-        final String body = features.stream()
-                .map(label -> String.format("@%s(%s)", JUNIT_5_DISPLAY_NAME_ANNOTATION, label))
-                .collect(Collectors.joining(","));
-        return String.format("@%s({%s})", ALLURE2_FEATURES_ANNOTATION, body);
     }
 
     private String getStoriesAnnotationText(final List<String> features) {
